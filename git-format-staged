@@ -82,13 +82,17 @@ def format_staged_files(
         staged_files = {
             path.decode("utf-8")
             for path in subprocess.check_output(
-                ["git", "diff", "--name-only"] + common_opts
-            ).splitlines()
+                ["git", "diff", "--name-only", "-z"] + common_opts
+            ).split(b"\0")
+            if path
         }
 
-        output = subprocess.check_output(["git", "diff-index"] + common_opts)
-        for line in output.splitlines():
-            entry = DiffIndexEntry(line.decode("utf-8"))
+        output = subprocess.check_output(["git", "diff-index", "-z"] + common_opts)
+        fields = output.split(b"\0")
+        for offset in range(0, len(fields) - 1, 2):
+            entry = DiffIndexEntry(
+                fields[offset].decode("utf-8"), fields[offset + 1].decode("utf-8")
+            )
             if entry.dst_mode in ("120000", "160000"):
                 # Do not process symlinks or submodules
                 continue
@@ -289,6 +293,14 @@ def replace_file_in_index(diff_entry: "DiffIndexEntry", new_object_hash: str):
     )
 
 
+def quote_patch_path(path: str) -> bytes:
+    return b'"' + b"".join(
+        bytes([value]) if 32 <= value < 127 and value not in (34, 92)
+        else f"\\{value:03o}".encode("ascii")
+        for value in path.encode("utf-8")
+    ) + b'"'
+
+
 def patch_working_file(path: str, orig_object_hash: str, new_object_hash: str):
     patch = subprocess.check_output(
         [
@@ -301,10 +313,19 @@ def patch_working_file(path: str, orig_object_hash: str, new_object_hash: str):
         ]
     )
 
-    # Substitute object hashes in patch header with path to working tree file
-    patch_b = patch.replace(orig_object_hash.encode(), path.encode()).replace(
-        new_object_hash.encode(), path.encode()
-    )
+    old_path = quote_patch_path("a/" + path)
+    new_path = quote_patch_path("b/" + path)
+    lines = patch.splitlines(keepends=True)
+    for offset, line in enumerate(lines):
+        if line.startswith(b"@@"):
+            break
+        if line.startswith(b"diff --git "):
+            lines[offset] = b"diff --git " + old_path + b" " + new_path + b"\n"
+        elif line.startswith(b"--- "):
+            lines[offset] = b"--- " + old_path + b"\n"
+        elif line.startswith(b"+++ "):
+            lines[offset] = b"+++ " + new_path + b"\n"
+    patch_b = b"".join(lines)
 
     apply_patch = subprocess.Popen(
         ["git", "apply", "-"],
@@ -321,9 +342,9 @@ def patch_working_file(path: str, orig_object_hash: str, new_object_hash: str):
         )
 
 
-# Format: src_mode dst_mode src_hash dst_hash status/score? src_path dst_path?
+# Format: src_mode dst_mode src_hash dst_hash status/score; the path is separate.
 diff_pat = re.compile(
-    r"^:(?P<src_mode>\d+) (?P<dst_mode>\d+) (?P<src_hash>[a-f0-9]+) (?P<dst_hash>[a-f0-9]+) (?P<status>[A-Z])(?P<score>\d+)?\t(?P<src_path>[^\t]+)(?:\t(?P<dst_path>[^\t]+))?$"
+    r"^:(?P<src_mode>\d+) (?P<dst_mode>\d+) (?P<src_hash>[a-f0-9]+) (?P<dst_hash>[a-f0-9]+) (?P<status>[A-Z])(?P<score>\d+)?$"
 )
 
 
@@ -337,8 +358,8 @@ class DiffIndexEntry:
     src_path: str
     dst_path: str | None
 
-    def __init__(self, diff_index_output_line: str):
-        "Parse a line of output from `git diff-index`"
+    def __init__(self, diff_index_output_line: str, path: str):
+        "Parse metadata and a NUL-delimited path from `git diff-index`."
         m = diff_pat.match(diff_index_output_line)
         if not m:
             raise ValueError(
@@ -350,8 +371,8 @@ class DiffIndexEntry:
         self.dst_hash = unless_zeroed(m.group("dst_hash"))
         self.status = m.group("status")
         self.score = int(m.group("score")) if m.group("score") else None
-        self.src_path = m.group("src_path")
-        self.dst_path = m.group("dst_path")
+        self.src_path = path
+        self.dst_path = None
 
 
 zeroed_pat = re.compile(r"^0+$")
