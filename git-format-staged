@@ -18,8 +18,11 @@ import argparse
 from collections.abc import Sequence
 from fnmatch import fnmatch
 from gettext import gettext as _
+import os
+from pathlib import Path
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -281,16 +284,52 @@ def object_is_empty(object_hash: str) -> bool:
 
 
 def replace_file_in_index(diff_entry: "DiffIndexEntry", new_object_hash: str):
-    _ = subprocess.check_call(
-        [
-            "git",
-            "update-index",
-            "--cacheinfo",
-            "{},{},{}".format(
-                diff_entry.dst_mode, new_object_hash, diff_entry.src_path
-            ),
-        ]
-    )
+    index = Path(
+        subprocess.check_output(
+            ["git", "rev-parse", "--git-path", "index"], text=True
+        ).strip()
+    ).resolve()
+    lock = index.with_name(index.name + ".lock")
+    with lock.open("xb") as target:
+        try:
+            with index.open("rb") as source:
+                shutil.copyfileobj(source, target)
+        except BaseException:
+            target.close()
+            lock.unlink()
+            raise
+    published = False
+    try:
+        environment = dict(os.environ, GIT_INDEX_FILE=str(lock))
+        entry = subprocess.check_output(
+            [
+                "git", "--literal-pathspecs", "ls-files", "--stage", "-z",
+                "--", diff_entry.src_path,
+            ],
+            env=environment,
+        )
+        expected = "{} {} 0\t{}\0".format(
+            diff_entry.dst_mode, diff_entry.dst_hash, diff_entry.src_path
+        ).encode("utf-8")
+        if entry != expected:
+            raise Exception(
+                "staged content changed while formatting {}".format(diff_entry.src_path)
+            )
+        subprocess.check_call(
+            [
+                "git", "update-index", "--cacheinfo",
+                "{},{},{}".format(
+                    diff_entry.dst_mode, new_object_hash, diff_entry.src_path
+                ),
+            ],
+            env=environment,
+        )
+        shutil.copymode(index, lock)
+        os.replace(lock, index)
+        published = True
+    finally:
+        if not published and lock.exists():
+            lock.unlink()
 
 
 def quote_patch_path(path: str) -> bytes:
