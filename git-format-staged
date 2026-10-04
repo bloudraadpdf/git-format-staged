@@ -59,11 +59,23 @@ def format_staged_files(
     verbose: bool = False,
     shell: Sequence[str] | None = None,
 ):
+    head = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", "HEAD"],
+        stdout=subprocess.PIPE,
+        check=False,
+    )
+    reference = (
+        "HEAD"
+        if head.returncode == 0
+        else subprocess.check_output(
+            ["git", "hash-object", "-w", "-t", "tree", "--stdin"], input=b""
+        ).decode().strip()
+    )
     common_opts = [
         "--cached",
         "--diff-filter=AM",  # select only file additions and modifications
         "--no-renames",
-        "HEAD",
+        reference,
     ]
 
     try:
